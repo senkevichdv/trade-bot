@@ -1,0 +1,1 @@
+trade_id,logged_at_utc,closed_time_utc,symbol,side,qty,avg_entry_price,avg_exit_price,closed_pnl,exec_type,order_id,leverage

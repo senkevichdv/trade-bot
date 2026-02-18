@@ -1,0 +1,11 @@
+ccxt>=4.5.38
+pandas>=2.3.3,<3.0
+numpy>=2.3.5
+vectorbt>=0.28.4
+pandas-ta-classic>=0.3.59
+python-dotenv>=1.2.1
+rich>=14.3.2
+plotly>=6.5.2
+requests>=2.32.5
+scipy>=1.17.0
+websocket-client>=1.9.0
