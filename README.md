@@ -88,6 +88,8 @@ Live engine details:
 - Market fallback has slippage/deviation guard (skip entry if price moved too far from signal)
 - SL/TP are recalculated from actual fill price and submitted via Bybit position trading-stop
 - Closed trades journal: writes only completed trades with non-zero realized PnL to `trade_journal.csv`
+- For each new closed trade, Telegram receives one lossless line in format:
+  `TRADE_CLOSED|trade_id=...|logged_at_utc=...|closed_time_utc=...|symbol=...|side=...|qty=...|avg_entry_price=...|avg_exit_price=...|closed_pnl=...|exec_type=...|order_id=...|leverage=...`
 
 ## 4) Strategy logic
 

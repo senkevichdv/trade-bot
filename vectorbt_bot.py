@@ -68,6 +68,7 @@ DEFAULT_FEE = DEFAULT_FEE_TAKER
 # Closed trade journal
 DEFAULT_TRADE_JOURNAL_PATH = "trade_journal.csv"
 DEFAULT_CLOSED_PNL_SYNC_INTERVAL_SEC = 20
+DEFAULT_TRADE_TELEGRAM_PREFIX = "TRADE_CLOSED"
 
 # Optimization robustness controls
 DEFAULT_OPT_MIN_TRADES = 20
@@ -77,13 +78,13 @@ DEFAULT_OPT_MIN_HALF_SIGNALS = 3
 
 @dataclass(frozen=True, slots=True)
 class StrategySettings:
-    rsi_long_threshold: float = 35.0
-    rsi_short_threshold: float = 65.0
+    rsi_long_threshold: float = 38.0
+    rsi_short_threshold: float = 62.0
     long_price_filter: str = "bb_lower"
     short_price_filter: str = "bb_upper"
     rr_ratio: float = 2.0
     atr_mult: float = 1.0
-    use_ema_trend_filter: bool = True
+    use_ema_trend_filter: bool = False
     ema_length: int = 200
     atr_regime_min_pct: float = 0.0015
     atr_regime_max_pct: float = 0.0060
@@ -191,6 +192,32 @@ def _ms_to_utc_iso(ms: Any) -> str:
         return ""
 
 
+def _safe_pipe_value(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return text.replace("|", "/").replace("\n", " ").strip()
+
+
+def format_trade_closed_telegram_line(record: dict[str, Any]) -> str:
+    ordered_keys = [
+        "trade_id",
+        "logged_at_utc",
+        "closed_time_utc",
+        "symbol",
+        "side",
+        "qty",
+        "avg_entry_price",
+        "avg_exit_price",
+        "closed_pnl",
+        "exec_type",
+        "order_id",
+        "leverage",
+    ]
+    parts = [DEFAULT_TRADE_TELEGRAM_PREFIX]
+    for key in ordered_keys:
+        parts.append(f"{key}={_safe_pipe_value(record.get(key, ''))}")
+    return "|".join(parts)
+
+
 def init_trade_journal(path: str) -> set[str]:
     journal_path = Path(path)
     seen_ids: set[str] = set()
@@ -251,6 +278,7 @@ def sync_closed_trades_to_csv(
         return 0
 
     new_rows: list[list[Any]] = []
+    telegram_lines: list[str] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for row in rows:
@@ -275,22 +303,37 @@ def sync_closed_trades_to_csv(
         if abs(closed_pnl) < 1e-12:
             continue
 
+        record = {
+            "trade_id": trade_id,
+            "logged_at_utc": now_iso,
+            "closed_time_utc": _ms_to_utc_iso(row.get("updatedTime") or row.get("createdTime")),
+            "symbol": str(row.get("symbol", config.symbol)),
+            "side": str(row.get("side", "")),
+            "qty": str(row.get("qty", "")),
+            "avg_entry_price": str(row.get("avgEntryPrice", "")),
+            "avg_exit_price": str(row.get("avgExitPrice", "")),
+            "closed_pnl": f"{closed_pnl:.8f}",
+            "exec_type": str(row.get("execType", "")),
+            "order_id": str(row.get("orderId", "")),
+            "leverage": str(row.get("leverage", "")),
+        }
         new_rows.append(
             [
-                trade_id,
-                now_iso,
-                _ms_to_utc_iso(row.get("updatedTime") or row.get("createdTime")),
-                str(row.get("symbol", config.symbol)),
-                str(row.get("side", "")),
-                str(row.get("qty", "")),
-                str(row.get("avgEntryPrice", "")),
-                str(row.get("avgExitPrice", "")),
-                f"{closed_pnl:.8f}",
-                str(row.get("execType", "")),
-                str(row.get("orderId", "")),
-                str(row.get("leverage", "")),
+                record["trade_id"],
+                record["logged_at_utc"],
+                record["closed_time_utc"],
+                record["symbol"],
+                record["side"],
+                record["qty"],
+                record["avg_entry_price"],
+                record["avg_exit_price"],
+                record["closed_pnl"],
+                record["exec_type"],
+                record["order_id"],
+                record["leverage"],
             ]
         )
+        telegram_lines.append(format_trade_closed_telegram_line(record))
         seen_ids.add(trade_id)
 
     if not new_rows:
@@ -300,6 +343,9 @@ def sync_closed_trades_to_csv(
         writer = csv.writer(file)
         for item in new_rows:
             writer.writerow(item)
+
+    for line in telegram_lines:
+        send_telegram_alert(config, line)
 
     return len(new_rows)
 
