@@ -65,6 +65,13 @@ DEFAULT_FEE_MAKER = 0.0004
 DEFAULT_FEE_TAKER = 0.0010
 DEFAULT_FEE = DEFAULT_FEE_TAKER
 
+# Live safety guard: trade only if recent rolling quality is acceptable
+DEFAULT_LIVE_GUARD_ENABLED = True
+DEFAULT_LIVE_GUARD_BARS = 1000
+DEFAULT_LIVE_GUARD_MIN_TRADES = 6
+DEFAULT_LIVE_GUARD_MIN_PF = 1.0
+DEFAULT_LIVE_GUARD_MIN_WR = 0.50
+
 # Closed trade journal
 DEFAULT_TRADE_JOURNAL_PATH = "trade_journal.csv"
 DEFAULT_CLOSED_PNL_SYNC_INTERVAL_SEC = 20
@@ -78,16 +85,16 @@ DEFAULT_OPT_MIN_HALF_SIGNALS = 3
 
 @dataclass(frozen=True, slots=True)
 class StrategySettings:
-    rsi_long_threshold: float = 38.0
-    rsi_short_threshold: float = 62.0
+    rsi_long_threshold: float = 35.0
+    rsi_short_threshold: float = 68.0
     long_price_filter: str = "bb_lower"
     short_price_filter: str = "bb_upper"
     rr_ratio: float = 2.0
-    atr_mult: float = 1.0
+    atr_mult: float = 1.4
     use_ema_trend_filter: bool = False
     ema_length: int = 200
-    atr_regime_min_pct: float = 0.0015
-    atr_regime_max_pct: float = 0.0060
+    atr_regime_min_pct: float = 0.0012
+    atr_regime_max_pct: float = 0.0055
 
 
 STRATEGY = StrategySettings()
@@ -1101,8 +1108,16 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
             if side is None:
                 console.print(f"[{ts}] No signal | Price={last['close']:.2f}")
             else:
+                guard_ok, guard_status = check_live_quality_guard(df, config, strategy=STRATEGY)
+                if not guard_ok:
+                    console.print(
+                        f"[{ts}] Signal {side.upper()} skipped by quality guard | {guard_status}"
+                    )
+                    continue
+
                 atr = float(last["atr_14"])
                 entry_price = float(last["close"])
+                sl_price = entry_price - atr if side == "buy" else entry_price + atr
 
                 qty = calculate_live_order_qty(
                     equity_usdt=usdt_equity,
@@ -1117,7 +1132,7 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
                 if qty <= 0:
                     console.print("[yellow]Signal found, but qty <= 0 due to risk/precision constraints.[/yellow]")
                 else:
-                    est_sl = entry_price - atr if side == "buy" else entry_price + atr
+                    est_sl = sl_price
                     est_tp = (
                         entry_price + atr * STRATEGY.rr_ratio
                         if side == "buy"
@@ -1368,6 +1383,53 @@ def evaluate_strategy(
     metrics = summarize_backtest(pf)
     trades = int(metrics["total_trades"])
     return metrics, trades, h1, h2
+
+
+def check_live_quality_guard(
+    df: pd.DataFrame,
+    config: BotConfig,
+    strategy: StrategySettings = STRATEGY,
+) -> tuple[bool, str]:
+    if not DEFAULT_LIVE_GUARD_ENABLED:
+        return True, "guard_disabled"
+
+    if len(df) < DEFAULT_LIVE_GUARD_BARS:
+        return False, f"warmup: bars={len(df)} < {DEFAULT_LIVE_GUARD_BARS}"
+
+    window = df.iloc[-DEFAULT_LIVE_GUARD_BARS:].copy()
+    long_entries, short_entries = generate_signals(window, strategy=strategy)
+    sl_pct, tp_pct, size_pct = build_risk_arrays(
+        window,
+        risk_per_trade=config.risk_per_trade,
+        rr_ratio=strategy.rr_ratio,
+        atr_mult=strategy.atr_mult,
+        max_leverage=config.max_leverage,
+    )
+    portfolio = run_vectorbt_backtest(
+        window,
+        long_entries,
+        short_entries,
+        sl_pct,
+        tp_pct,
+        size_pct,
+        slippage=DEFAULT_SLIPPAGE,
+        fee=DEFAULT_FEE,
+        init_cash=DEFAULT_INIT_CASH,
+    )
+    metrics = summarize_backtest(portfolio)
+
+    trades = int(metrics["total_trades"])
+    wr = float(metrics["win_rate"])
+    pf_val = float(metrics["profit_factor"])
+
+    if trades < DEFAULT_LIVE_GUARD_MIN_TRADES:
+        return False, f"trades={trades} < {DEFAULT_LIVE_GUARD_MIN_TRADES}"
+    if pf_val < DEFAULT_LIVE_GUARD_MIN_PF:
+        return False, f"pf={pf_val:.2f} < {DEFAULT_LIVE_GUARD_MIN_PF:.2f}"
+    if wr < DEFAULT_LIVE_GUARD_MIN_WR:
+        return False, f"wr={wr * 100:.1f}% < {DEFAULT_LIVE_GUARD_MIN_WR * 100:.1f}%"
+
+    return True, f"ok: trades={trades}, pf={pf_val:.2f}, wr={wr * 100:.1f}%"
 
 
 def run_optimize_command(config: BotConfig, exchange: ccxt.bybit, bars: int, top_n: int) -> int:
