@@ -71,6 +71,15 @@ Walk-forward out-of-sample optimization:
 python vectorbt_bot.py optimize_wfo --bars 10000 --train 3000 --test 1000 --step 1000 --top 10
 ```
 
+Warm local historical cache (CSV) for faster repeated runs:
+
+```bash
+python vectorbt_bot.py cache_data --symbol ETH/USDT:USDT --timeframe 5m --bars 30000
+python vectorbt_bot.py cache_data --symbol ETH/USDT:USDT --timeframe 4h --bars 2000
+```
+
+Cache files are stored in `data_cache/` and reused automatically by backtests/optimizations.
+
 ## 3) Live loop (5m, WebSocket-first)
 
 Live mode places real orders by default:
@@ -105,7 +114,7 @@ Live engine details:
 ## 5) Notes
 
 - Runtime defaults (symbol, timeframe, risk, leverage) are defined in `vectorbt_bot.py` constants.
-- If target metrics vary on a given sample (WR/PF), run multiple windows and compare WFO/MC robustness.
+- Target profile: PF > 1.2, max drawdown < 5%, and stable positive month (28+ day sample with positive return).
 - This is educational software; validate behavior carefully before any production deployment.
 
 ## 6) File structure

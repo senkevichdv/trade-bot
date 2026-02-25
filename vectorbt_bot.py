@@ -68,9 +68,9 @@ DEFAULT_FEE = DEFAULT_FEE_TAKER
 # Live safety guard: trade only if recent rolling quality is acceptable
 DEFAULT_LIVE_GUARD_ENABLED = True
 DEFAULT_LIVE_GUARD_BARS = 1000
-DEFAULT_LIVE_GUARD_MIN_TRADES = 6
-DEFAULT_LIVE_GUARD_MIN_PF = 1.0
-DEFAULT_LIVE_GUARD_MIN_WR = 0.50
+DEFAULT_LIVE_GUARD_MIN_TRADES = 5
+DEFAULT_LIVE_GUARD_MIN_PF = 1.10
+DEFAULT_LIVE_GUARD_MIN_WR = 0.55
 
 # Adaptive live strategy controls
 DEFAULT_ADAPTIVE_ENABLED = True
@@ -80,6 +80,16 @@ DEFAULT_ADAPTIVE_TRAIN_BARS = 4000
 DEFAULT_ADAPTIVE_VALID_BARS = 1000
 DEFAULT_ADAPTIVE_MIN_TRAIN_TRADES = 12
 DEFAULT_ADAPTIVE_MIN_VALID_TRADES = 4
+DEFAULT_ADAPTIVE_MIN_TRAIN_PF = 0.90
+DEFAULT_ADAPTIVE_MIN_VALID_PF = 1.00
+DEFAULT_ADAPTIVE_MIN_VALID_WR = 0.52
+
+# Regime-switch controls (single-strategy dynamic adaptation)
+DEFAULT_REGIME_SWITCH_ENABLED = False
+DEFAULT_TREND_EMA_SLOPE_BARS = 12
+DEFAULT_TREND_EMA_DIST_PCT = 0.0006
+DEFAULT_TREND_RSI_LONG = 48.0
+DEFAULT_TREND_RSI_SHORT = 52.0
 
 # Closed trade journal
 DEFAULT_TRADE_JOURNAL_PATH = "trade_journal.csv"
@@ -91,19 +101,29 @@ DEFAULT_OPT_MIN_TRADES = 20
 DEFAULT_OPT_TARGET_TRADES = 40
 DEFAULT_OPT_MIN_HALF_SIGNALS = 3
 
+# Strategy objective profile
+DEFAULT_TARGET_PF = 1.20
+DEFAULT_TARGET_MAX_DD = 0.05
+DEFAULT_TARGET_MONTH_DAYS = 28.0
+DEFAULT_OOS_STABLE_MIN_POSITIVE_FOLD_RATIO = 0.55
+
+# Historical OHLCV cache (shared across backtests/optimizations)
+DEFAULT_OHLCV_CACHE_DIR = "data_cache"
+DEFAULT_OHLCV_CACHE_MAX_ROWS = 120_000
+
 
 @dataclass(frozen=True, slots=True)
 class StrategySettings:
-    rsi_long_threshold: float = 35.0
-    rsi_short_threshold: float = 68.0
+    rsi_long_threshold: float = 30.0
+    rsi_short_threshold: float = 70.0
     long_price_filter: str = "bb_lower"
     short_price_filter: str = "bb_upper"
     rr_ratio: float = 2.0
-    atr_mult: float = 1.4
+    atr_mult: float = 1.0
     use_ema_trend_filter: bool = False
     ema_length: int = 200
-    atr_regime_min_pct: float = 0.0012
-    atr_regime_max_pct: float = 0.0055
+    atr_regime_min_pct: float = 0.0018
+    atr_regime_max_pct: float = 0.0065
 
 
 STRATEGY = StrategySettings()
@@ -177,6 +197,23 @@ def create_exchange(config: BotConfig) -> ccxt.bybit:
     }
 
     exchange = ccxt.bybit(exchange_params)
+    return exchange
+
+
+def create_spot_exchange(config: BotConfig) -> ccxt.bybit:
+    if not config.api_key or not config.api_secret:
+        raise ValueError(
+            "BYBIT_API_KEY/BYBIT_API_SECRET are required in .env for all bot modes"
+        )
+
+    exchange = ccxt.bybit(
+        {
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot", "fetchCurrencies": False},
+            "apiKey": config.api_key,
+            "secret": config.api_secret,
+        }
+    )
     return exchange
 
 
@@ -366,8 +403,47 @@ def sync_closed_trades_to_csv(
     return len(new_rows)
 
 
+def _cache_symbol_token(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _ohlcv_cache_path(symbol: str, timeframe: str) -> Path:
+    cache_dir = Path(DEFAULT_OHLCV_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{_cache_symbol_token(symbol)}_{timeframe}.csv"
+
+
+def _load_ohlcv_cache(symbol: str, timeframe: str) -> pd.DataFrame:
+    path = _ohlcv_cache_path(symbol, timeframe)
+    if not path.exists():
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    try:
+        df = pd.read_csv(path)
+        if "timestamp" not in df.columns:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.set_index("timestamp").sort_index()
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col not in df.columns:
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        return df[["open", "high", "low", "close", "volume"]].astype(float)
+    except Exception:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+
+def _save_ohlcv_cache(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
+    path = _ohlcv_cache_path(symbol, timeframe)
+    clipped = df.sort_index().tail(DEFAULT_OHLCV_CACHE_MAX_ROWS).copy()
+    out = clipped.reset_index().rename(columns={"index": "timestamp"})
+    out.to_csv(path, index=False)
+
+
 def fetch_ohlcv_dataframe(
-    exchange: ccxt.bybit, symbol: str, timeframe: str, limit: int
+    exchange: ccxt.bybit,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    require_fresh: bool = False,
 ) -> pd.DataFrame:
     if limit <= 0:
         raise ValueError("limit must be > 0")
@@ -375,38 +451,71 @@ def fetch_ohlcv_dataframe(
     max_batch = 1000
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     now_ms = exchange.milliseconds()
-    since = now_ms - (limit + 200) * tf_ms
 
-    data: list[list[float]] = []
-    while len(data) < limit:
-        batch_limit = min(max_batch, limit - len(data))
-        batch = exchange.fetch_ohlcv(symbol=symbol, timeframe=timeframe, since=since, limit=batch_limit)
+    cached = _load_ohlcv_cache(symbol, timeframe)
+    cached_rows = len(cached)
+    if cached_rows >= limit and not require_fresh:
+        return cached.tail(limit).copy()
+
+    need_refresh = cached_rows < limit
+    if require_fresh and cached_rows > 0:
+        last_cached_ms = int(cached.index[-1].timestamp() * 1000)
+        if now_ms - last_cached_ms > tf_ms * 2:
+            need_refresh = True
+
+    if not need_refresh and cached_rows >= limit:
+        return cached.tail(limit).copy()
+
+    if cached_rows > 0:
+        since = int(cached.index[-1].timestamp() * 1000) + tf_ms
+    else:
+        since = now_ms - (limit + 400) * tf_ms
+
+    fetched_rows: list[list[float]] = []
+    while True:
+        batch = exchange.fetch_ohlcv(symbol=symbol, timeframe=timeframe, since=since, limit=max_batch)
         if not batch:
             break
 
-        if data:
-            last_ts = int(data[-1][0])
+        if fetched_rows:
+            last_ts = int(fetched_rows[-1][0])
             batch = [row for row in batch if int(row[0]) > last_ts]
-            if not batch:
-                break
+        elif cached_rows > 0:
+            last_ts = int(cached.index[-1].timestamp() * 1000)
+            batch = [row for row in batch if int(row[0]) > last_ts]
 
-        data.extend(batch)
-        since = int(batch[-1][0]) + tf_ms
-
-        if len(batch) < batch_limit:
+        if not batch:
             break
 
-    if len(data) > limit:
-        data = data[-limit:]
+        fetched_rows.extend(batch)
+        since = int(batch[-1][0]) + tf_ms
 
-    if not data:
+        if not require_fresh and (cached_rows + len(fetched_rows)) >= limit:
+            break
+        if require_fresh and since >= (now_ms - tf_ms):
+            break
+        if len(batch) < max_batch:
+            break
+
+    combined = cached.copy()
+    if fetched_rows:
+        new_df = pd.DataFrame(
+            fetched_rows,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        new_df["timestamp"] = pd.to_datetime(new_df["timestamp"], unit="ms", utc=True)
+        new_df = new_df.set_index("timestamp").sort_index().astype(float)
+        if combined.empty:
+            combined = new_df
+        else:
+            combined = pd.concat([combined, new_df], axis=0)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        _save_ohlcv_cache(symbol, timeframe, combined)
+
+    if combined.empty:
         raise RuntimeError("No OHLCV data received from Bybit")
 
-    df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp").sort_index()
-    df = df.astype(float)
-    return df
+    return combined.tail(limit).copy()
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -453,12 +562,12 @@ def generate_signals(
         df["macd"].shift(1) >= df["macd_signal"].shift(1)
     )
 
-    long_entries = (
+    base_long_entries = (
         (df["rsi_10"] < strategy.rsi_long_threshold)
         & macd_cross_up
         & (df["close"] > df[strategy.long_price_filter])
     )
-    short_entries = (
+    base_short_entries = (
         (df["rsi_10"] > strategy.rsi_short_threshold)
         & macd_cross_down
         & (df["close"] < df[strategy.short_price_filter])
@@ -468,8 +577,56 @@ def generate_signals(
     atr_regime_ok = (df["atr_pct"] >= strategy.atr_regime_min_pct) & (
         df["atr_pct"] <= strategy.atr_regime_max_pct
     )
-    long_entries = long_entries & atr_regime_ok
-    short_entries = short_entries & atr_regime_ok
+    base_long_entries = base_long_entries & atr_regime_ok
+    base_short_entries = base_short_entries & atr_regime_ok
+
+    long_entries = base_long_entries.copy()
+    short_entries = base_short_entries.copy()
+
+    if DEFAULT_REGIME_SWITCH_ENABLED:
+        ema = df["ema_200"]
+        ema_slope = ema - ema.shift(DEFAULT_TREND_EMA_SLOPE_BARS)
+        ema_dist_pct = ((df["close"] - ema).abs() / df["close"]).fillna(0.0)
+
+        trend_up = (
+            (df["close"] > ema)
+            & (ema_slope > 0)
+            & (ema_dist_pct >= DEFAULT_TREND_EMA_DIST_PCT)
+        )
+        trend_down = (
+            (df["close"] < ema)
+            & (ema_slope < 0)
+            & (ema_dist_pct >= DEFAULT_TREND_EMA_DIST_PCT)
+        )
+        trend_regime = trend_up | trend_down
+        range_regime = ~trend_regime
+
+        trend_long = (
+            trend_up
+            & (df["rsi_10"] < DEFAULT_TREND_RSI_LONG)
+            & (df["macd"] > df["macd_signal"])
+            & (df["close"] > df["bb_mid"])
+            & atr_regime_ok
+        )
+        trend_short = (
+            trend_down
+            & (df["rsi_10"] > DEFAULT_TREND_RSI_SHORT)
+            & (df["macd"] < df["macd_signal"])
+            & (df["close"] < df["bb_mid"])
+            & atr_regime_ok
+        )
+
+        range_long = base_long_entries & range_regime
+        range_short = base_short_entries & range_regime
+
+        regime_long = trend_long | range_long
+        regime_short = trend_short | range_short
+
+        min_required_signals = max(2, int(len(df) / 500))
+        regime_signal_count = int((regime_long | regime_short).fillna(False).sum())
+        if regime_signal_count >= min_required_signals:
+            long_entries = regime_long
+            short_entries = regime_short
 
     # Trend alignment (optional)
     if strategy.use_ema_trend_filter:
@@ -1035,7 +1192,13 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
     )
 
     market_meta = get_market_meta(exchange, config.symbol)
-    history = fetch_ohlcv_dataframe(exchange, config.symbol, config.timeframe, limit=bars)
+    history = fetch_ohlcv_dataframe(
+        exchange,
+        config.symbol,
+        config.timeframe,
+        limit=bars,
+        require_fresh=True,
+    )
     latest_candles = deque(history.reset_index().to_dict("records"), maxlen=bars)
     stream = BybitKlineStream(config, config.symbol, config.timeframe)
     stream.start()
@@ -1230,7 +1393,13 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
             # Optional WS health check with REST fallback refresh.
             if stream.last_message_ts and (time.time() - stream.last_message_ts) > 120:
                 console.print("[yellow]WS stale detected, refreshing history via REST fallback...[/yellow]")
-                history = fetch_ohlcv_dataframe(exchange, config.symbol, config.timeframe, limit=bars)
+                history = fetch_ohlcv_dataframe(
+                    exchange,
+                    config.symbol,
+                    config.timeframe,
+                    limit=bars,
+                    require_fresh=True,
+                )
                 latest_candles = deque(history.reset_index().to_dict("records"), maxlen=bars)
 
             now_ts = time.time()
@@ -1251,7 +1420,13 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
             console.print("[yellow]No closed candle from WS yet, waiting...[/yellow]")
             if stream.last_message_ts and (time.time() - stream.last_message_ts) > 120:
                 console.print("[yellow]WS timeout, rebuilding stream state from REST...[/yellow]")
-                history = fetch_ohlcv_dataframe(exchange, config.symbol, config.timeframe, limit=bars)
+                history = fetch_ohlcv_dataframe(
+                    exchange,
+                    config.symbol,
+                    config.timeframe,
+                    limit=bars,
+                    require_fresh=True,
+                )
                 latest_candles = deque(history.reset_index().to_dict("records"), maxlen=bars)
         except ccxt.NetworkError as exc:
             console.print(f"[yellow]Network error:[/yellow] {exc}")
@@ -1276,6 +1451,7 @@ def run_backtest_command(
     console.print(f"[cyan]Fetching {bars} bars for {config.symbol} ({config.timeframe})...[/cyan]")
     df = fetch_ohlcv_dataframe(exchange, config.symbol, config.timeframe, limit=bars)
     df = add_indicators(df)
+    span_days = 0.0
     if len(df) > 1:
         span_hours = (df.index[-1] - df.index[0]).total_seconds() / 3600.0
         span_days = span_hours / 24.0
@@ -1323,17 +1499,30 @@ def run_backtest_command(
 
     print_backtest_tables(metrics, wfo_df, mc)
 
-    # Soft checks for target profile
-    target_wr = 0.60
-    target_pf = 1.50
-    if metrics["win_rate"] < target_wr or metrics["profit_factor"] < target_pf:
+    # Soft checks for target profile: PF/DD and stable positive month
+    target_pf_ok = float(metrics["profit_factor"]) >= DEFAULT_TARGET_PF
+    target_dd_ok = abs(float(metrics["max_drawdown"])) <= DEFAULT_TARGET_MAX_DD
+    month_window_ok = span_days >= DEFAULT_TARGET_MONTH_DAYS
+    month_return_ok = float(metrics["total_return"]) > 0.0
+
+    if target_pf_ok and target_dd_ok and month_window_ok and month_return_ok:
         console.print(
-            "[yellow]Target check not met on this sample: "
-            f"WR={metrics['win_rate'] * 100:.2f}% (target > {target_wr * 100:.0f}%), "
-            f"PF={metrics['profit_factor']:.2f} (target > {target_pf:.2f}).[/yellow]"
+            "[bold green]Target profile achieved: "
+            f"PF>={DEFAULT_TARGET_PF:.2f}, DD<={DEFAULT_TARGET_MAX_DD * 100:.1f}%, "
+            f"positive {DEFAULT_TARGET_MONTH_DAYS:.0f}+ day window.[/bold green]"
         )
     else:
-        console.print("[bold green]Target profile achieved on this sample (WR/PF).[/bold green]")
+        console.print(
+            "[yellow]Target check not met on this sample: "
+            f"PF={metrics['profit_factor']:.2f} (target >= {DEFAULT_TARGET_PF:.2f}), "
+            f"DD={abs(metrics['max_drawdown']) * 100:.2f}% (target <= {DEFAULT_TARGET_MAX_DD * 100:.1f}%), "
+            f"Return={metrics['total_return'] * 100:.2f}% (target > 0%).[/yellow]"
+        )
+        if not month_window_ok:
+            console.print(
+                f"[yellow]Monthly stability check pending: sample is {span_days:.2f} days, "
+                f"need >= {DEFAULT_TARGET_MONTH_DAYS:.0f} days.[/yellow]"
+            )
 
     if with_plot:
         show_plot(pf, title=f"{config.symbol} {config.timeframe} Strategy")
@@ -1369,20 +1558,27 @@ def iter_strategy_candidates() -> list[StrategySettings]:
 
 def score_metrics(metrics: dict[str, float], trades: int) -> float:
     wr = float(metrics["win_rate"])
-    pf_val = float(metrics["profit_factor"])
+    pf_val = clamp_profit_factor(float(metrics["profit_factor"]))
     ret_val = float(metrics["total_return"])
     dd = abs(float(metrics["max_drawdown"]))
 
-    wr_component = max(0.0, (wr - 0.45) / 0.55)
-    pf_component = max(0.0, pf_val)
-    trades_component = min(1.0, trades / DEFAULT_OPT_TARGET_TRADES)
-    drawdown_penalty = 1.0 + dd * 4.0
-    return (
-        (pf_component**1.35)
-        * (1.0 + wr_component)
-        * (1.0 + max(0.0, ret_val))
-        * trades_component
-    ) / drawdown_penalty
+    wr_component = max(0.0, wr)
+    ret_component = max(-0.15, ret_val)
+    drawdown_penalty = 1.0 + dd * 6.0
+    trades_floor = 1.0 if trades >= 5 else 0.8
+    return ((pf_val**1.6) * (1.0 + wr_component * 0.5) * (1.0 + ret_component)) / drawdown_penalty * trades_floor
+
+
+def score_oos_metrics(metrics: dict[str, float], trades: int) -> float:
+    pf_val = clamp_profit_factor(float(metrics["profit_factor"]))
+    wr = float(metrics["win_rate"])
+    ret_val = float(metrics["total_return"])
+    dd = abs(float(metrics["max_drawdown"]))
+
+    ret_component = max(-0.12, ret_val)
+    dd_penalty = 1.0 + dd * 8.0
+    trades_floor = 1.0 if trades >= 3 else 0.75
+    return ((pf_val**1.8) * (1.0 + wr * 0.4) * (1.0 + ret_component)) / dd_penalty * trades_floor
 
 
 def signal_distribution(entries: pd.Series, shorts: pd.Series) -> tuple[int, int]:
@@ -1461,6 +1657,13 @@ def select_adaptive_strategy(df: pd.DataFrame, config: BotConfig) -> tuple[Strat
         train_ret = float(train_m["total_return"])
         valid_ret = float(valid_m["total_return"])
         valid_dd = abs(float(valid_m["max_drawdown"]))
+
+        if train_pf < DEFAULT_ADAPTIVE_MIN_TRAIN_PF:
+            continue
+        if valid_pf < DEFAULT_ADAPTIVE_MIN_VALID_PF:
+            continue
+        if valid_wr < DEFAULT_ADAPTIVE_MIN_VALID_WR:
+            continue
 
         stability_penalty = abs(train_pf - valid_pf) * 0.25
         score = (
@@ -1701,6 +1904,15 @@ def run_optimize_wfo_command(
 
         strategy = best_train["strategy"]
         test_metrics, test_trades, test_h1, test_h2 = evaluate_strategy(test_df, strategy, config)
+        test_pf = float(test_metrics["profit_factor"])
+        test_ret = float(test_metrics["total_return"])
+        test_dd = abs(float(test_metrics["max_drawdown"]))
+        test_score = score_oos_metrics(test_metrics, test_trades)
+        test_positive = int(
+            (test_pf >= 1.0)
+            and (test_ret > 0.0)
+            and (test_dd <= DEFAULT_TARGET_MAX_DD)
+        )
         fold_rows.append(
             {
                 "fold": float(len(fold_rows) + 1),
@@ -1709,9 +1921,11 @@ def run_optimize_wfo_command(
                 "train_trades": float(best_train["train_trades"]),
                 "test_trades": float(test_trades),
                 "test_wr": float(test_metrics["win_rate"]),
-                "test_pf": float(test_metrics["profit_factor"]),
-                "test_ret": float(test_metrics["total_return"]),
-                "test_dd": abs(float(test_metrics["max_drawdown"])),
+                "test_pf": test_pf,
+                "test_ret": test_ret,
+                "test_dd": test_dd,
+                "test_score": test_score,
+                "test_positive": float(test_positive),
                 "test_h1": float(test_h1),
                 "test_h2": float(test_h2),
                 "strategy": (
@@ -1736,25 +1950,30 @@ def run_optimize_wfo_command(
     summary.add_column("Avg PF", justify="right")
     summary.add_column("Avg Return", justify="right")
     summary.add_column("Avg DD", justify="right")
+    summary.add_column("Positive OOS", justify="right")
+    pf_mean = fold_df["test_pf"].replace([np.inf, -np.inf], np.nan).mean()
+    positive_ratio = float(fold_df["test_positive"].mean()) if not fold_df.empty else 0.0
     summary.add_row(
         str(len(fold_df)),
         f"{fold_df['test_trades'].mean():.1f}",
         f"{fold_df['test_wr'].mean() * 100:.2f}%",
-        f"{fold_df['test_pf'].replace([np.inf, -np.inf], np.nan).mean():.2f}",
+        f"{pf_mean:.2f}",
         f"{fold_df['test_ret'].mean() * 100:.2f}%",
         f"{fold_df['test_dd'].mean() * 100:.2f}%",
+        f"{positive_ratio * 100:.1f}%",
     )
     console.print(summary)
 
-    table = Table(title="WFO Fold Details (Top by OOS PF)", box=box.SIMPLE)
+    table = Table(title="WFO Fold Details (Top by OOS Score)", box=box.SIMPLE)
     table.add_column("Fold", justify="right")
     table.add_column("Test Trades", justify="right")
     table.add_column("Test WR", justify="right")
     table.add_column("Test PF", justify="right")
     table.add_column("Test Return", justify="right")
+    table.add_column("Pos", justify="right")
     table.add_column("Strategy", justify="left")
 
-    ranked = fold_df.sort_values(by=["test_pf", "test_wr", "test_ret"], ascending=False)
+    ranked = fold_df.sort_values(by=["test_positive", "test_score", "test_pf"], ascending=False)
     for _, row in ranked.head(top_n).iterrows():
         table.add_row(
             str(int(row["fold"])),
@@ -1762,10 +1981,409 @@ def run_optimize_wfo_command(
             f"{row['test_wr'] * 100:.2f}%",
             f"{row['test_pf']:.2f}",
             f"{row['test_ret'] * 100:.2f}%",
+            "yes" if int(row["test_positive"]) == 1 else "no",
             str(row["strategy"]),
         )
     console.print(table)
 
+    median_ret = float(fold_df["test_ret"].median())
+    stable_ok = (
+        positive_ratio >= DEFAULT_OOS_STABLE_MIN_POSITIVE_FOLD_RATIO
+        and float(pf_mean) >= 1.0
+        and median_ret > 0.0
+    )
+    if stable_ok:
+        console.print(
+            "[bold green]OOS stability check PASSED:[/bold green] "
+            f"positive_folds={positive_ratio * 100:.1f}%, avg_pf={pf_mean:.2f}, median_ret={median_ret * 100:.2f}%"
+        )
+    else:
+        console.print(
+            "[yellow]OOS stability check not met:[/yellow] "
+            f"positive_folds={positive_ratio * 100:.1f}% (target >= {DEFAULT_OOS_STABLE_MIN_POSITIVE_FOLD_RATIO * 100:.0f}%), "
+            f"avg_pf={pf_mean:.2f} (target >= 1.00), median_ret={median_ret * 100:.2f}% (target > 0%)"
+        )
+
+    return 0
+
+
+def build_spot_dca_dataframe(
+    exchange: ccxt.bybit,
+    symbol: str,
+    bars_5m: int,
+    entry_timeframe: str = "5m",
+) -> pd.DataFrame:
+    df_5m = fetch_ohlcv_dataframe(exchange, symbol=symbol, timeframe=entry_timeframe, limit=bars_5m)
+    df_5m = df_5m.rename(columns={
+        "open": "open_5m",
+        "high": "high_5m",
+        "low": "low_5m",
+        "close": "close_5m",
+        "volume": "volume_5m",
+    })
+
+    # 4h regime context
+    bars_4h = max(1200, int(bars_5m / 48) + 300)
+    df_4h = fetch_ohlcv_dataframe(exchange, symbol=symbol, timeframe="4h", limit=bars_4h)
+    df_4h["ema200_4h"] = ta.ema(df_4h["close"], length=200)
+    df_4h["ema200_slope_4h"] = df_4h["ema200_4h"] - df_4h["ema200_4h"].shift(6)
+    df_4h = df_4h[["close", "ema200_4h", "ema200_slope_4h"]].rename(columns={"close": "close_4h"})
+
+    # 5m signal indicators
+    df_5m["ema20_5m"] = ta.ema(df_5m["close_5m"], length=20)
+    df_5m["rsi14_5m"] = ta.rsi(df_5m["close_5m"], length=14)
+    bb = ta.bbands(df_5m["close_5m"], length=20)
+    if bb is None or bb.empty:
+        raise RuntimeError("Bollinger Bands calculation failed for DCA backtest")
+    df_5m["bb_lower_5m"] = bb.iloc[:, 0]
+    df_5m["bb_mid_5m"] = bb.iloc[:, 1]
+    df_5m["bb_upper_5m"] = bb.iloc[:, 2]
+
+    adx = ta.adx(df_5m["high_5m"], df_5m["low_5m"], df_5m["close_5m"], length=14)
+    if adx is not None and not adx.empty:
+        df_5m["adx_5m"] = adx.iloc[:, 0]
+    else:
+        df_5m["adx_5m"] = np.nan
+
+    merged = pd.merge_asof(
+        df_5m.sort_index(),
+        df_4h.sort_index(),
+        left_index=True,
+        right_index=True,
+        direction="backward",
+    )
+    return merged.dropna().copy()
+
+
+def run_spot_dca_backtest_command(
+    config: BotConfig,
+    exchange: ccxt.bybit,
+    symbol: str,
+    bars: int,
+    entry_timeframe: str,
+    budget_usdt: float,
+    tranche_pct: float,
+    max_buys: int,
+    dca_step_pct: float,
+    tp_pct: float,
+    partial_tp_pct: float = 0.012,
+    regime_break_bars: int = 288,
+    recycle_last_lot: bool = True,
+) -> int:
+    console.print(
+        f"[cyan]Spot DCA backtest | {symbol} | tf={entry_timeframe} | bars={bars} | budget={budget_usdt:.2f} USDT[/cyan]"
+    )
+
+    df = build_spot_dca_dataframe(
+        exchange=exchange,
+        symbol=symbol,
+        bars_5m=bars,
+        entry_timeframe=entry_timeframe,
+    )
+    if len(df) < 500:
+        console.print("[yellow]Not enough data after indicators for DCA backtest.[/yellow]")
+        return 0
+
+    result = simulate_spot_dca(
+        df=df,
+        budget_usdt=budget_usdt,
+        tranche_pct=tranche_pct,
+        max_buys=max_buys,
+        dca_step_pct=dca_step_pct,
+        tp_pct=tp_pct,
+        partial_tp_pct=partial_tp_pct,
+        regime_break_bars=regime_break_bars,
+        recycle_last_lot=recycle_last_lot,
+    )
+
+    final_equity = float(result["final_equity"])
+    total_return = float(result["total_return"])
+    max_dd = float(result["max_dd"])
+    cycles = int(result["cycles"])
+    win_cycles = int(result["win_cycles"])
+    max_buys_hit = int(result["max_buys_hit"])
+    open_position = bool(result["open_position"])
+    partial_exits = int(result["partial_exits"])
+
+    span_days = 0.0
+    if len(df) > 1:
+        span_days = (df.index[-1] - df.index[0]).total_seconds() / 86400.0
+
+    monthly_return = 0.0
+    if span_days > 0:
+        monthly_return = (1.0 + total_return) ** (30.0 / span_days) - 1.0
+
+    summary = Table(title="ETH Spot DCA Backtest", box=box.SIMPLE_HEAVY)
+    summary.add_column("Metric", justify="left")
+    summary.add_column("Value", justify="right")
+    summary.add_row("Symbol", symbol)
+    summary.add_row("Timeframe", f"{entry_timeframe} entries + 4h trend")
+    summary.add_row("Sample span", f"{span_days:.2f} days")
+    summary.add_row("Initial budget", f"{budget_usdt:.2f} USDT")
+    summary.add_row("Final equity", f"{final_equity:.2f} USDT")
+    summary.add_row("Total return", f"{total_return * 100:.2f}%")
+    summary.add_row("Monthly return (normalized)", f"{monthly_return * 100:.2f}%")
+    summary.add_row("Completed cycles", str(cycles))
+    summary.add_row("Cycle win rate", f"{(win_cycles / cycles * 100) if cycles else 0.0:.2f}%")
+    summary.add_row("Max drawdown", f"{max_dd * 100:.2f}%")
+    summary.add_row("Max-buy cycles", str(max_buys_hit))
+    summary.add_row("Partial exits", str(partial_exits))
+    summary.add_row("Open position", "yes" if open_position else "no")
+    console.print(summary)
+
+    return 0
+
+
+def simulate_spot_dca(
+    df: pd.DataFrame,
+    budget_usdt: float,
+    tranche_pct: float,
+    max_buys: int,
+    dca_step_pct: float,
+    tp_pct: float,
+    partial_tp_pct: float,
+    regime_break_bars: int,
+    recycle_last_lot: bool,
+) -> dict[str, float | int | bool]:
+    tranches = max(1, int(max_buys))
+    tranche_cash = budget_usdt * tranche_pct
+    if tranche_cash <= 0:
+        tranche_cash = budget_usdt / tranches
+
+    cash = float(budget_usdt)
+    lots: list[tuple[float, float]] = []  # (qty, entry_price)
+    cycles = 0
+    win_cycles = 0
+    max_buys_hit = 0
+    partial_exits = 0
+    position_bars = 0
+    cycle_realized_pnl = 0.0
+
+    equity_curve: list[float] = []
+
+    def lots_qty() -> float:
+        return float(sum(q for q, _ in lots))
+
+    def lots_cost() -> float:
+        return float(sum(q * p for q, p in lots))
+
+    def avg_price() -> float:
+        qty = lots_qty()
+        if qty <= 0:
+            return 0.0
+        return lots_cost() / qty
+
+    for i in range(2, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+        price = float(row["close_5m"])
+
+        equity_curve.append(cash + lots_qty() * price)
+
+        trend_ok = bool((row["close_4h"] > row["ema200_4h"]) and (row["ema200_slope_4h"] > 0))
+        pullback_event = bool(
+            (prev["close_5m"] <= prev["bb_lower_5m"])
+            or ((prev["close_5m"] < prev["bb_mid_5m"]) and (prev["rsi14_5m"] < 40))
+        )
+        rebound_confirm = bool((row["close_5m"] > row["bb_lower_5m"]) and (row["rsi14_5m"] > prev["rsi14_5m"]))
+
+        if not lots:
+            position_bars = 0
+            cycle_realized_pnl = 0.0
+            if trend_ok and pullback_event and rebound_confirm and cash > 0:
+                spend = min(tranche_cash, cash)
+                if spend > 0:
+                    buy_qty = spend / price
+                    lots.append((buy_qty, price))
+                    cash -= spend
+            continue
+
+        position_bars += 1
+
+        # Recycle last lot on local rebound
+        if recycle_last_lot and len(lots) >= 2:
+            last_qty, last_price = lots[-1]
+            if price >= last_price * (1.0 + partial_tp_pct):
+                cash += last_qty * price
+                cycle_realized_pnl += (price - last_price) * last_qty
+                lots.pop()
+                partial_exits += 1
+
+        # DCA by distance from latest lot price
+        if len(lots) < tranches and cash > 0:
+            _, anchor_price = lots[-1]
+            next_dca_price = anchor_price * (1.0 - dca_step_pct)
+            if price <= next_dca_price:
+                spend = min(tranche_cash, cash)
+                if spend > 0:
+                    add_qty = spend / price
+                    lots.append((add_qty, price))
+                    cash -= spend
+                    if len(lots) == tranches:
+                        max_buys_hit += 1
+
+        avg = avg_price()
+        qty = lots_qty()
+        tp_hit = qty > 0 and price >= avg * (1.0 + tp_pct)
+        soft_exit = (not trend_ok) and qty > 0 and price >= avg * 1.003
+        regime_break_exit = (not trend_ok) and (position_bars >= max(96, int(regime_break_bars)))
+
+        if qty > 0 and (tp_hit or soft_exit or regime_break_exit):
+            proceeds = qty * price
+            cost = lots_cost()
+            cycle_realized_pnl += proceeds - cost
+            cash += proceeds
+            cycles += 1
+            if cycle_realized_pnl > 0:
+                win_cycles += 1
+            lots = []
+            position_bars = 0
+            cycle_realized_pnl = 0.0
+
+    final_price = float(df.iloc[-1]["close_5m"])
+    final_equity = cash + lots_qty() * final_price
+    total_return = (final_equity / budget_usdt) - 1.0
+
+    equity_series = pd.Series(equity_curve, dtype=float)
+    if equity_series.empty:
+        max_dd = 0.0
+    else:
+        running_max = equity_series.cummax()
+        dd = (equity_series / running_max) - 1.0
+        max_dd = float(abs(dd.min())) if not dd.empty else 0.0
+
+    return {
+        "final_equity": final_equity,
+        "total_return": total_return,
+        "max_dd": max_dd,
+        "cycles": cycles,
+        "win_cycles": win_cycles,
+        "max_buys_hit": max_buys_hit,
+        "partial_exits": partial_exits,
+        "open_position": bool(lots),
+    }
+
+
+def run_optimize_dca_command(
+    config: BotConfig,
+    exchange: ccxt.bybit,
+    symbol: str,
+    bars: int,
+    entry_timeframe: str,
+    budget_usdt: float,
+    top_n: int,
+) -> int:
+    console.print(
+        f"[cyan]Optimize DCA | {symbol} | tf={entry_timeframe} | bars={bars} | budget={budget_usdt:.2f}[/cyan]"
+    )
+    df = build_spot_dca_dataframe(
+        exchange=exchange,
+        symbol=symbol,
+        bars_5m=bars,
+        entry_timeframe=entry_timeframe,
+    )
+
+    candidates: list[dict[str, float]] = []
+    for tranche_pct in [0.16, 0.20]:
+        for max_buys in [5, 6]:
+            for dca_step in [0.02, 0.03, 0.04]:
+                for tp in [0.02, 0.025, 0.03]:
+                    for partial_tp in [0.008, 0.012, 0.016]:
+                        for regime_break in [192, 288]:
+                            res = simulate_spot_dca(
+                                df=df,
+                                budget_usdt=budget_usdt,
+                                tranche_pct=tranche_pct,
+                                max_buys=max_buys,
+                                dca_step_pct=dca_step,
+                                tp_pct=tp,
+                                partial_tp_pct=partial_tp,
+                                regime_break_bars=regime_break,
+                                recycle_last_lot=True,
+                            )
+                            span_days = (df.index[-1] - df.index[0]).total_seconds() / 86400.0 if len(df) > 1 else 0.0
+                            monthly_return = 0.0
+                            if span_days > 0:
+                                monthly_return = (1.0 + float(res["total_return"])) ** (30.0 / span_days) - 1.0
+
+                            max_dd = float(res["max_dd"])
+                            if max_dd > 0.20:
+                                continue
+
+                            score = monthly_return * 2.0 + float(res["total_return"]) - max_dd * 1.2
+                            candidates.append(
+                                {
+                                    "score": score,
+                                    "monthly": monthly_return,
+                                    "ret": float(res["total_return"]),
+                                    "dd": max_dd,
+                                    "cycles": float(res["cycles"]),
+                                    "wr": (float(res["win_cycles"]) / float(res["cycles"])) if float(res["cycles"]) > 0 else 0.0,
+                                    "partial_exits": float(res["partial_exits"]),
+                                    "tranche": tranche_pct,
+                                    "max_buys": float(max_buys),
+                                    "dca_step": dca_step,
+                                    "tp": tp,
+                                    "partial_tp": partial_tp,
+                                    "regime_break": float(regime_break),
+                                }
+                            )
+
+    if not candidates:
+        console.print("[yellow]No DCA candidates passed drawdown filter.[/yellow]")
+        return 0
+
+    ranked = sorted(candidates, key=lambda r: float(r["score"]), reverse=True)
+    table = Table(title="DCA Optimize Top Candidates", box=box.SIMPLE_HEAVY)
+    table.add_column("#", justify="right")
+    table.add_column("Monthly", justify="right")
+    table.add_column("Return", justify="right")
+    table.add_column("DD", justify="right")
+    table.add_column("Cycles", justify="right")
+    table.add_column("Cycle WR", justify="right")
+    table.add_column("DCA", justify="left")
+
+    for idx, row in enumerate(ranked[:top_n], start=1):
+        dca_desc = (
+            f"tr={row['tranche']:.2f}, buys={int(row['max_buys'])}, step={row['dca_step']*100:.1f}% "
+            f"tp={row['tp']*100:.1f}% p_tp={row['partial_tp']*100:.1f}% rb={int(row['regime_break'])}"
+        )
+        table.add_row(
+            str(idx),
+            f"{row['monthly'] * 100:.2f}%",
+            f"{row['ret'] * 100:.2f}%",
+            f"{row['dd'] * 100:.2f}%",
+            f"{int(row['cycles'])}",
+            f"{row['wr'] * 100:.1f}%",
+            dca_desc,
+        )
+    console.print(table)
+    return 0
+
+
+def run_cache_data_command(
+    exchange: ccxt.bybit,
+    symbol: str,
+    timeframe: str,
+    bars: int,
+) -> int:
+    console.print(
+        f"[cyan]Caching OHLCV | {symbol} | tf={timeframe} | bars={bars}[/cyan]"
+    )
+    df = fetch_ohlcv_dataframe(
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=bars,
+        require_fresh=True,
+    )
+    path = _ohlcv_cache_path(symbol, timeframe)
+    span_days = 0.0
+    if len(df) > 1:
+        span_days = (df.index[-1] - df.index[0]).total_seconds() / 86400.0
+    console.print(
+        f"[green]Cache ready:[/green] {path} | rows={len(df)} | span={span_days:.2f} days"
+    )
     return 0
 
 
@@ -1788,6 +2406,30 @@ def parse_args() -> argparse.Namespace:
     optimize_wfo.add_argument("--step", type=int, default=1000, help="Window step size")
     optimize_wfo.add_argument("--top", type=int, default=10, help="How many top folds to print")
 
+    backtest_dca = subparsers.add_parser("backtest_dca", help="Run ETH spot DCA backtest")
+    backtest_dca.add_argument("--bars", type=int, default=12000, help="Number of 5m bars to fetch")
+    backtest_dca.add_argument("--entry-tf", type=str, default="15m", help="Entry timeframe for DCA signals")
+    backtest_dca.add_argument("--symbol", type=str, default="ETH/USDT:USDT", help="Spot symbol")
+    backtest_dca.add_argument("--budget", type=float, default=100.0, help="Initial USDT budget")
+    backtest_dca.add_argument("--tranche-pct", type=float, default=0.35, help="Capital share per DCA buy")
+    backtest_dca.add_argument("--max-buys", type=int, default=5, help="Max number of buys per cycle")
+    backtest_dca.add_argument("--dca-step", type=float, default=0.02, help="DCA spacing from average entry")
+    backtest_dca.add_argument("--tp", type=float, default=0.025, help="Take-profit from average entry")
+    backtest_dca.add_argument("--partial-tp", type=float, default=0.020, help="Partial exit TP from latest lot")
+    backtest_dca.add_argument("--regime-break-bars", type=int, default=288, help="Bars before regime-break forced exit")
+
+    optimize_dca = subparsers.add_parser("optimize_dca", help="Grid-search ETH spot DCA parameters")
+    optimize_dca.add_argument("--bars", type=int, default=12000, help="Number of 5m bars to fetch")
+    optimize_dca.add_argument("--entry-tf", type=str, default="5m", help="Entry timeframe for DCA signals")
+    optimize_dca.add_argument("--symbol", type=str, default="ETH/USDT:USDT", help="Symbol for DCA optimization")
+    optimize_dca.add_argument("--budget", type=float, default=100.0, help="Initial USDT budget")
+    optimize_dca.add_argument("--top", type=int, default=10, help="How many top candidates to print")
+
+    cache_data = subparsers.add_parser("cache_data", help="Warm local OHLCV cache")
+    cache_data.add_argument("--symbol", type=str, default="ETH/USDT:USDT", help="Symbol to cache")
+    cache_data.add_argument("--timeframe", type=str, default="5m", help="Timeframe to cache")
+    cache_data.add_argument("--bars", type=int, default=30000, help="Bars to cache")
+
     live = subparsers.add_parser("live", help="Run 5m live loop")
     live.add_argument("--bars", type=int, default=500, help="Bars to pull each loop")
 
@@ -1797,6 +2439,45 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config()
+
+    if args.command == "backtest_dca":
+        spot_exchange = create_spot_exchange(config)
+        return run_spot_dca_backtest_command(
+            config=config,
+            exchange=spot_exchange,
+            symbol=args.symbol,
+            bars=args.bars,
+            entry_timeframe=args.entry_tf,
+            budget_usdt=args.budget,
+            tranche_pct=args.tranche_pct,
+            max_buys=args.max_buys,
+            dca_step_pct=args.dca_step,
+            tp_pct=args.tp,
+            partial_tp_pct=args.partial_tp,
+            regime_break_bars=args.regime_break_bars,
+        )
+
+    if args.command == "optimize_dca":
+        spot_exchange = create_spot_exchange(config)
+        return run_optimize_dca_command(
+            config=config,
+            exchange=spot_exchange,
+            symbol=args.symbol,
+            bars=args.bars,
+            entry_timeframe=args.entry_tf,
+            budget_usdt=args.budget,
+            top_n=args.top,
+        )
+
+    if args.command == "cache_data":
+        exchange = create_exchange(config)
+        return run_cache_data_command(
+            exchange=exchange,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            bars=args.bars,
+        )
+
     exchange = create_exchange(config)
 
     if args.command == "backtest":
