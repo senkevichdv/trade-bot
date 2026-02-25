@@ -72,6 +72,15 @@ DEFAULT_LIVE_GUARD_MIN_TRADES = 6
 DEFAULT_LIVE_GUARD_MIN_PF = 1.0
 DEFAULT_LIVE_GUARD_MIN_WR = 0.50
 
+# Adaptive live strategy controls
+DEFAULT_ADAPTIVE_ENABLED = True
+DEFAULT_ADAPTIVE_INTERVAL_HOURS = 24
+DEFAULT_ADAPTIVE_LOOKBACK_BARS = 6000
+DEFAULT_ADAPTIVE_TRAIN_BARS = 4000
+DEFAULT_ADAPTIVE_VALID_BARS = 1000
+DEFAULT_ADAPTIVE_MIN_TRAIN_TRADES = 12
+DEFAULT_ADAPTIVE_MIN_VALID_TRADES = 4
+
 # Closed trade journal
 DEFAULT_TRADE_JOURNAL_PATH = "trade_journal.csv"
 DEFAULT_CLOSED_PNL_SYNC_INTERVAL_SEC = 20
@@ -1031,6 +1040,9 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
     stream = BybitKlineStream(config, config.symbol, config.timeframe)
     stream.start()
 
+    current_strategy = STRATEGY
+    last_adaptive_ts = 0.0
+
     seen_trade_ids = init_trade_journal(DEFAULT_TRADE_JOURNAL_PATH)
     last_journal_sync_ts = 0.0
 
@@ -1045,6 +1057,31 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
                 day_start_equity = None
                 halted_for_day = False
                 console.print("[green]New UTC day started: daily limits reset.[/green]")
+
+            now_ts = time.time()
+            adaptive_interval_sec = int(DEFAULT_ADAPTIVE_INTERVAL_HOURS * 3600)
+            should_adapt = (
+                DEFAULT_ADAPTIVE_ENABLED
+                and (last_adaptive_ts == 0.0 or (now_ts - last_adaptive_ts) >= adaptive_interval_sec)
+            )
+            if should_adapt:
+                try:
+                    adapt_df = fetch_ohlcv_dataframe(
+                        exchange,
+                        config.symbol,
+                        config.timeframe,
+                        limit=max(DEFAULT_ADAPTIVE_LOOKBACK_BARS, bars),
+                    )
+                    adapt_df = add_indicators(adapt_df)
+                    selected_strategy, adapt_message = select_adaptive_strategy(adapt_df, config)
+                    current_strategy = selected_strategy
+                    console.print(f"[cyan]{adapt_message}[/cyan]")
+                    send_telegram_alert(config, f"[BOT] {adapt_message}")
+                    last_adaptive_ts = now_ts
+                except Exception as adapt_exc:
+                    console.print(f"[yellow]Adaptive update failed:[/yellow] {adapt_exc}")
+                    send_telegram_alert(config, f"[BOT] Adaptive update failed: {adapt_exc}")
+                    last_adaptive_ts = now_ts
 
             balance = exchange.fetch_balance()
             usdt_equity = float(balance.get("USDT", {}).get("total", 0.0))
@@ -1092,7 +1129,7 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
 
             df = pd.DataFrame(list(latest_candles)).set_index("timestamp").sort_index().astype(float)
             df = add_indicators(df)
-            long_entries, short_entries = generate_signals(df)
+            long_entries, short_entries = generate_signals(df, strategy=current_strategy)
 
             last = df.iloc[-1]
             ts = df.index[-1]
@@ -1108,7 +1145,7 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
             if side is None:
                 console.print(f"[{ts}] No signal | Price={last['close']:.2f}")
             else:
-                guard_ok, guard_status = check_live_quality_guard(df, config, strategy=STRATEGY)
+                guard_ok, guard_status = check_live_quality_guard(df, config, strategy=current_strategy)
                 if not guard_ok:
                     console.print(
                         f"[{ts}] Signal {side.upper()} skipped by quality guard | {guard_status}"
@@ -1134,9 +1171,9 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
                 else:
                     est_sl = sl_price
                     est_tp = (
-                        entry_price + atr * STRATEGY.rr_ratio
+                        entry_price + atr * current_strategy.rr_ratio
                         if side == "buy"
-                        else entry_price - atr * STRATEGY.rr_ratio
+                        else entry_price - atr * current_strategy.rr_ratio
                     )
                     msg = (
                         f"{ts} SIGNAL {side.upper()} {config.symbol}\n"
@@ -1167,9 +1204,9 @@ def run_live_loop(config: BotConfig, exchange: ccxt.bybit, bars: int) -> None:
 
                     sl_price = fill_price - atr if side == "buy" else fill_price + atr
                     tp_price = (
-                        fill_price + atr * STRATEGY.rr_ratio
+                        fill_price + atr * current_strategy.rr_ratio
                         if side == "buy"
-                        else fill_price - atr * STRATEGY.rr_ratio
+                        else fill_price - atr * current_strategy.rr_ratio
                     )
 
                     stop_ok = set_position_trading_stop(
@@ -1352,6 +1389,102 @@ def signal_distribution(entries: pd.Series, shorts: pd.Series) -> tuple[int, int
     signal_mask = (entries | shorts).fillna(False)
     split_idx = int(len(signal_mask) * 0.5)
     return int(signal_mask.iloc[:split_idx].sum()), int(signal_mask.iloc[split_idx:].sum())
+
+
+def strategy_brief(strategy: StrategySettings) -> str:
+    return (
+        f"RSI<{strategy.rsi_long_threshold:.0f}/>{strategy.rsi_short_threshold:.0f} "
+        f"{strategy.long_price_filter}/{strategy.short_price_filter} "
+        f"atrx={strategy.atr_mult:.1f} "
+        f"trend={'ema' if strategy.use_ema_trend_filter else 'none'} "
+        f"band={strategy.atr_regime_min_pct:.4f}-{strategy.atr_regime_max_pct:.4f}"
+    )
+
+
+def clamp_profit_factor(value: float) -> float:
+    if not np.isfinite(value):
+        return 3.0
+    return float(min(max(value, 0.0), 3.0))
+
+
+def iter_adaptive_candidates() -> list[StrategySettings]:
+    candidates: list[StrategySettings] = []
+    for rsi_long in [33.0, 35.0, 38.0]:
+        for rsi_short in [65.0, 68.0, 70.0]:
+            for atr_mult in [1.0, 1.2, 1.4]:
+                for use_trend in [False, True]:
+                    for atr_min, atr_max in [
+                        (0.0012, 0.0055),
+                        (0.0015, 0.0060),
+                        (0.0018, 0.0065),
+                    ]:
+                        candidates.append(
+                            StrategySettings(
+                                rsi_long_threshold=rsi_long,
+                                rsi_short_threshold=rsi_short,
+                                long_price_filter="bb_lower",
+                                short_price_filter="bb_upper",
+                                rr_ratio=2.0,
+                                atr_mult=atr_mult,
+                                use_ema_trend_filter=use_trend,
+                                ema_length=200,
+                                atr_regime_min_pct=atr_min,
+                                atr_regime_max_pct=atr_max,
+                            )
+                        )
+    return candidates
+
+
+def select_adaptive_strategy(df: pd.DataFrame, config: BotConfig) -> tuple[StrategySettings, str]:
+    required = DEFAULT_ADAPTIVE_TRAIN_BARS + DEFAULT_ADAPTIVE_VALID_BARS
+    if len(df) < required:
+        return STRATEGY, f"adaptive fallback: bars={len(df)} < {required}"
+
+    window = df.iloc[-required:].copy()
+    train_df = window.iloc[: DEFAULT_ADAPTIVE_TRAIN_BARS].copy()
+    valid_df = window.iloc[DEFAULT_ADAPTIVE_TRAIN_BARS :].copy()
+
+    ranked: list[tuple[float, StrategySettings, dict[str, float], dict[str, float], int, int]] = []
+    for candidate in iter_adaptive_candidates():
+        train_m, train_trades, _, _ = evaluate_strategy(train_df, candidate, config)
+        valid_m, valid_trades, _, _ = evaluate_strategy(valid_df, candidate, config)
+
+        if train_trades < DEFAULT_ADAPTIVE_MIN_TRAIN_TRADES:
+            continue
+        if valid_trades < DEFAULT_ADAPTIVE_MIN_VALID_TRADES:
+            continue
+
+        train_pf = clamp_profit_factor(float(train_m["profit_factor"]))
+        valid_pf = clamp_profit_factor(float(valid_m["profit_factor"]))
+        train_wr = float(train_m["win_rate"])
+        valid_wr = float(valid_m["win_rate"])
+        train_ret = float(train_m["total_return"])
+        valid_ret = float(valid_m["total_return"])
+        valid_dd = abs(float(valid_m["max_drawdown"]))
+
+        stability_penalty = abs(train_pf - valid_pf) * 0.25
+        score = (
+            valid_pf * 1.7
+            + train_pf * 0.8
+            + valid_wr * 0.7
+            + max(-0.15, valid_ret)
+            + max(-0.15, train_ret) * 0.5
+            - valid_dd * 0.6
+            - stability_penalty
+        )
+        ranked.append((score, candidate, train_m, valid_m, train_trades, valid_trades))
+
+    if not ranked:
+        return STRATEGY, "adaptive fallback: no robust candidate"
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    _, best, train_m, valid_m, train_trades, valid_trades = ranked[0]
+    details = (
+        f"adaptive selected {strategy_brief(best)} | "
+        f"train: trades={train_trades}, pf={float(train_m['profit_factor']):.2f}, wr={float(train_m['win_rate']) * 100:.1f}% | "
+        f"valid: trades={valid_trades}, pf={float(valid_m['profit_factor']):.2f}, wr={float(valid_m['win_rate']) * 100:.1f}%"
+    )
+    return best, details
 
 
 def evaluate_strategy(
